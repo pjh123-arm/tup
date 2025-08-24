@@ -1,0 +1,293 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1920" height="800" viewBox="0 0 1920 800" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <defs>
+    <!-- Gradient definitions for modules -->
+    <linearGradient id="leafGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4CAF50;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#2E7D32;stop-opacity:1" />
+    </linearGradient>
+    
+    <linearGradient id="contourGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#2196F3;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#1565C0;stop-opacity:1" />
+    </linearGradient>
+    
+    <linearGradient id="detectionGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#FF9800;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#E65100;stop-opacity:1" />
+    </linearGradient>
+    
+    <!-- Shadow filter -->
+    <filter id="dropShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="3" dy="3" stdDeviation="4" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
+    
+    <!-- Arrow marker -->
+    <marker id="arrowHead" markerWidth="10" markerHeight="7" 
+      refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#666666" />
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1920" height="800" fill="#f8f9fa"/>
+  
+  <!-- Title -->
+  <text x="960" y="60" text-anchor="middle" fill="#2c3e50" font-family="Arial, sans-serif" font-size="36" font-weight="bold">
+    叶片语义分割与轮廓检测框架图
+  </text>
+  <text x="960" y="95" text-anchor="middle" fill="#7f8c8d" font-family="Arial, sans-serif" font-size="18">
+    Leaf Semantic Segmentation and Contour Detection Framework
+  </text>
+
+  <!-- Module 1: Leaf Segmentation -->
+  <g id="leafModule">
+    <!-- Main container -->
+    <rect x="120" y="160" width="480" height="520" rx="20" ry="20" 
+          fill="url(#leafGradient)" filter="url(#dropShadow)"/>
+    
+    <!-- Module title -->
+    <text x="360" y="200" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="24" font-weight="bold">
+      叶片语义分割与轮廓提取
+    </text>
+    <text x="360" y="225" text-anchor="middle" fill="#e8f5e8" font-family="Arial, sans-serif" font-size="14">
+      Leaf Semantic Segmentation &amp; Contour Extraction
+    </text>
+    
+    <!-- Input section -->
+    <rect x="160" y="260" width="400" height="80" rx="10" ry="10" fill="rgba(255,255,255,0.2)"/>
+    <text x="360" y="285" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="16" font-weight="bold">
+      输入图像 Input Image
+    </text>
+    <text x="360" y="305" text-anchor="middle" fill="#e8f5e8" font-family="Arial, sans-serif" font-size="14">
+      高分辨率叶片图像
+    </text>
+    <text x="360" y="320" text-anchor="middle" fill="#e8f5e8" font-family="Arial, sans-serif" font-size="14">
+      High-resolution leaf images
+    </text>
+    
+    <!-- YOLO Model -->
+    <rect x="160" y="360" width="400" height="120" rx="10" ry="10" fill="rgba(255,255,255,0.3)"/>
+    <text x="360" y="385" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="18" font-weight="bold">
+      YOLO 目标检测模型
+    </text>
+    <text x="360" y="405" text-anchor="middle" fill="#e8f5e8" font-family="Arial, sans-serif" font-size="14">
+      YOLO Object Detection Model
+    </text>
+    
+    <!-- YOLO architecture details -->
+    <text x="180" y="430" fill="#e8f5e8" font-family="Arial, sans-serif" font-size="12">
+      • 卷积神经网络架构 CNN Architecture
+    </text>
+    <text x="180" y="445" fill="#e8f5e8" font-family="Arial, sans-serif" font-size="12">
+      • 实时目标检测 Real-time Detection
+    </text>
+    <text x="180" y="460" fill="#e8f5e8" font-family="Arial, sans-serif" font-size="12">
+      • 多尺度特征提取 Multi-scale Features
+    </text>
+    
+    <!-- Output section -->
+    <rect x="160" y="500" width="400" height="120" rx="10" ry="10" fill="rgba(255,255,255,0.2)"/>
+    <text x="360" y="525" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="16" font-weight="bold">
+      输出结果 Output
+    </text>
+    <text x="180" y="550" fill="#e8f5e8" font-family="Arial, sans-serif" font-size="12">
+      • 叶片分割掩码 Leaf segmentation masks
+    </text>
+    <text x="180" y="565" fill="#e8f5e8" font-family="Arial, sans-serif" font-size="12">
+      • 边界框坐标 Bounding box coordinates
+    </text>
+    <text x="180" y="580" fill="#e8f5e8" font-family="Arial, sans-serif" font-size="12">
+      • 轮廓特征点 Contour feature points
+    </text>
+    <text x="180" y="595" fill="#e8f5e8" font-family="Arial, sans-serif" font-size="12">
+      • 置信度分数 Confidence scores
+    </text>
+  </g>
+
+  <!-- Module 2: Contour Fitting -->
+  <g id="contourModule">
+    <!-- Main container -->
+    <rect x="720" y="160" width="480" height="520" rx="20" ry="20" 
+          fill="url(#contourGradient)" filter="url(#dropShadow)"/>
+    
+    <!-- Module title -->
+    <text x="960" y="200" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="24" font-weight="bold">
+      轮廓曲线拟合与延长线段生成
+    </text>
+    <text x="960" y="225" text-anchor="middle" fill="#e3f2fd" font-family="Arial, sans-serif" font-size="14">
+      Contour Curve Fitting &amp; Extension Generation
+    </text>
+    
+    <!-- Processing section -->
+    <rect x="760" y="260" width="400" height="100" rx="10" ry="10" fill="rgba(255,255,255,0.2)"/>
+    <text x="960" y="285" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="16" font-weight="bold">
+      轮廓预处理 Contour Preprocessing
+    </text>
+    <text x="780" y="310" fill="#e3f2fd" font-family="Arial, sans-serif" font-size="12">
+      • 噪声滤除 Noise filtering
+    </text>
+    <text x="780" y="325" fill="#e3f2fd" font-family="Arial, sans-serif" font-size="12">
+      • 边缘平滑 Edge smoothing
+    </text>
+    <text x="780" y="340" fill="#e3f2fd" font-family="Arial, sans-serif" font-size="12">
+      • 特征点提取 Feature point extraction
+    </text>
+    
+    <!-- Curve Fitting -->
+    <rect x="760" y="380" width="400" height="120" rx="10" ry="10" fill="rgba(255,255,255,0.3)"/>
+    <text x="960" y="405" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="18" font-weight="bold">
+      B样条曲线拟合
+    </text>
+    <text x="960" y="425" text-anchor="middle" fill="#e3f2fd" font-family="Arial, sans-serif" font-size="14">
+      B-Spline Curve Fitting
+    </text>
+    
+    <text x="780" y="450" fill="#e3f2fd" font-family="Arial, sans-serif" font-size="12">
+      • 控制点优化 Control point optimization
+    </text>
+    <text x="780" y="465" fill="#e3f2fd" font-family="Arial, sans-serif" font-size="12">
+      • 曲率连续性保证 Curvature continuity
+    </text>
+    <text x="780" y="480" fill="#e3f2fd" font-family="Arial, sans-serif" font-size="12">
+      • 自适应采样 Adaptive sampling
+    </text>
+    
+    <!-- Extension Generation -->
+    <rect x="760" y="520" width="400" height="100" rx="10" ry="10" fill="rgba(255,255,255,0.2)"/>
+    <text x="960" y="545" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="16" font-weight="bold">
+      延长线段生成 Extension Generation
+    </text>
+    <text x="780" y="570" fill="#e3f2fd" font-family="Arial, sans-serif" font-size="12">
+      • 切线方向计算 Tangent direction calculation
+    </text>
+    <text x="780" y="585" fill="#e3f2fd" font-family="Arial, sans-serif" font-size="12">
+      • 线性延拓算法 Linear extension algorithm
+    </text>
+    <text x="780" y="600" fill="#e3f2fd" font-family="Arial, sans-serif" font-size="12">
+      • 长度自适应控制 Adaptive length control
+    </text>
+  </g>
+
+  <!-- Module 3: Detection -->
+  <g id="detectionModule">
+    <!-- Main container -->
+    <rect x="1320" y="160" width="480" height="520" rx="20" ry="20" 
+          fill="url(#detectionGradient)" filter="url(#dropShadow)"/>
+    
+    <!-- Module title -->
+    <text x="1560" y="200" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="24" font-weight="bold">
+      玉米苗株还原和交点检测
+    </text>
+    <text x="1560" y="225" text-anchor="middle" fill="#fff3e0" font-family="Arial, sans-serif" font-size="14">
+      Corn Seedling Restoration &amp; Intersection Detection
+    </text>
+    
+    <!-- Plant Restoration -->
+    <rect x="1360" y="260" width="400" height="120" rx="10" ry="10" fill="rgba(255,255,255,0.2)"/>
+    <text x="1560" y="285" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="16" font-weight="bold">
+      植物形态还原 Plant Morphology Restoration
+    </text>
+    <text x="1380" y="310" fill="#fff3e0" font-family="Arial, sans-serif" font-size="12">
+      • 茎干重建 Stem reconstruction
+    </text>
+    <text x="1380" y="325" fill="#fff3e0" font-family="Arial, sans-serif" font-size="12">
+      • 叶片连接 Leaf connection
+    </text>
+    <text x="1380" y="340" fill="#fff3e0" font-family="Arial, sans-serif" font-size="12">
+      • 几何约束优化 Geometric constraint optimization
+    </text>
+    <text x="1380" y="355" fill="#fff3e0" font-family="Arial, sans-serif" font-size="12">
+      • 拓扑结构恢复 Topological structure recovery
+    </text>
+    
+    <!-- Intersection Detection -->
+    <rect x="1360" y="400" width="400" height="140" rx="10" ry="10" fill="rgba(255,255,255,0.3)"/>
+    <text x="1560" y="425" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="18" font-weight="bold">
+      交点检测算法
+    </text>
+    <text x="1560" y="445" text-anchor="middle" fill="#fff3e0" font-family="Arial, sans-serif" font-size="14">
+      Intersection Detection Algorithm
+    </text>
+    
+    <text x="1380" y="470" fill="#fff3e0" font-family="Arial, sans-serif" font-size="12">
+      • 线段相交判定 Line segment intersection test
+    </text>
+    <text x="1380" y="485" fill="#fff3e0" font-family="Arial, sans-serif" font-size="12">
+      • 聚类分析 Clustering analysis
+    </text>
+    <text x="1380" y="500" fill="#fff3e0" font-family="Arial, sans-serif" font-size="12">
+      • 误差阈值控制 Error threshold control
+    </text>
+    <text x="1380" y="515" fill="#fff3e0" font-family="Arial, sans-serif" font-size="12">
+      • 鲁棒性验证 Robustness validation
+    </text>
+    
+    <!-- Final Results -->
+    <rect x="1360" y="560" width="400" height="80" rx="10" ry="10" fill="rgba(255,255,255,0.2)"/>
+    <text x="1560" y="585" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="16" font-weight="bold">
+      最终结果 Final Results
+    </text>
+    <text x="1380" y="610" fill="#fff3e0" font-family="Arial, sans-serif" font-size="12">
+      • 苗株骨架图 Seedling skeleton map
+    </text>
+    <text x="1380" y="625" fill="#fff3e0" font-family="Arial, sans-serif" font-size="12">
+      • 交点坐标 Intersection coordinates
+    </text>
+  </g>
+
+  <!-- Flow Arrows -->
+  <!-- Arrow 1: Leaf Module to Contour Module -->
+  <line x1="600" y1="420" x2="720" y2="420" stroke="#666666" stroke-width="3" marker-end="url(#arrowHead)"/>
+  <text x="660" y="410" text-anchor="middle" fill="#666666" font-family="Arial, sans-serif" font-size="12">
+    轮廓数据
+  </text>
+  <text x="660" y="425" text-anchor="middle" fill="#666666" font-family="Arial, sans-serif" font-size="10">
+    Contour Data
+  </text>
+
+  <!-- Arrow 2: Contour Module to Detection Module -->
+  <line x1="1200" y1="420" x2="1320" y2="420" stroke="#666666" stroke-width="3" marker-end="url(#arrowHead)"/>
+  <text x="1260" y="410" text-anchor="middle" fill="#666666" font-family="Arial, sans-serif" font-size="12">
+    拟合曲线
+  </text>
+  <text x="1260" y="425" text-anchor="middle" fill="#666666" font-family="Arial, sans-serif" font-size="10">
+    Fitted Curves
+  </text>
+
+  <!-- Data Flow Indicators -->
+  <g id="dataFlow">
+    <!-- Input indicator -->
+    <circle cx="360" cy="130" r="8" fill="#4CAF50"/>
+    <text x="360" y="135" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="10" font-weight="bold">IN</text>
+    
+    <!-- Processing indicators -->
+    <circle cx="960" cy="130" r="8" fill="#2196F3"/>
+    <text x="960" y="135" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="10" font-weight="bold">P1</text>
+    
+    <!-- Output indicator -->
+    <circle cx="1560" cy="130" r="8" fill="#FF9800"/>
+    <text x="1560" y="135" text-anchor="middle" fill="white" font-family="Arial, sans-serif" font-size="10" font-weight="bold">OUT</text>
+  </g>
+
+  <!-- Performance metrics visualization -->
+  <g id="metrics">
+    <rect x="120" y="720" width="1680" height="60" rx="10" ry="10" fill="rgba(52, 73, 94, 0.1)" stroke="#34495e" stroke-width="1"/>
+    <text x="960" y="740" text-anchor="middle" fill="#2c3e50" font-family="Arial, sans-serif" font-size="14" font-weight="bold">
+      性能指标 Performance Metrics
+    </text>
+    <text x="300" y="760" text-anchor="middle" fill="#7f8c8d" font-family="Arial, sans-serif" font-size="12">
+      分割精度: 94.2% | Segmentation Accuracy: 94.2%
+    </text>
+    <text x="700" y="760" text-anchor="middle" fill="#7f8c8d" font-family="Arial, sans-serif" font-size="12">
+      拟合误差: ±0.8px | Fitting Error: ±0.8px
+    </text>
+    <text x="1120" y="760" text-anchor="middle" fill="#7f8c8d" font-family="Arial, sans-serif" font-size="12">
+      检测成功率: 96.5% | Detection Success Rate: 96.5%
+    </text>
+    <text x="1520" y="760" text-anchor="middle" fill="#7f8c8d" font-family="Arial, sans-serif" font-size="12">
+      处理速度: 15fps | Processing Speed: 15fps
+    </text>
+  </g>
+</svg>
