@@ -1,0 +1,29 @@
+{
+  "detection_summary": {
+    "red_rectangles_count": 2,
+    "brown_rectangles_count": 2,
+    "cyan_points_count": 5,
+    "excluded_red_rectangles_count": 1
+  },
+  "accuracy_summary": {
+    "first_layer_accuracies": [
+      1.0,
+      1.0
+    ],
+    "first_layer_avg_accuracy": 1.0,
+    "second_layer_accuracy": 0.41666666666666663
+  },
+  "z_values_summary": {
+    "z1_values": [
+      0.5,
+      0.5
+    ],
+    "z2_values": [
+      0.5,
+      0.5
+    ],
+    "z1_avg": 0.5,
+    "z2_avg": 0.5
+  },
+  "processing_timestamp": "2025-07-05T08:46:16.166572"
+}
