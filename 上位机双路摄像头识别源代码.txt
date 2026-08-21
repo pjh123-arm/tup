@@ -1,0 +1,1135 @@
+# -*- coding: utf-8 -*-
+"""
+TensorRT 加速版 作物/杂草 检测系统
+基于 YOLOv8 TensorRT + 卡尔曼滤波跟踪
+
+  - 支持多相机独立串口触发指令 (如 Camera 1 触发 1,2; Camera 0 触发 3,4)
+  - 支持多相机独立绘制不重叠的虚拟线段
+  - 【新增】支持多路相机完全独立控制线段起始位置、长度、间隔与高度
+  - 增强型卡尔曼跟踪器（轨迹拟合垂直速度 vy + 线前基准点预测 + 状态继承）
+  - 多目标关联跟踪器（IOU + 中心距离混合关联 + 轨迹恢复）
+  - 预测撞线检测（目标消失后仍可通过垂直速度外推预测触发）
+"""
+
+import ctypes
+import os
+import shutil
+import random
+import sys
+import math
+import threading
+import time
+import traceback
+import cv2
+import numpy as np
+import pycuda.autoinit  # noqa: F401
+import pycuda.driver as cuda
+import tensorrt as trt
+import serial
+import argparse
+from collections import defaultdict, deque
+from scipy.optimize import linear_sum_assignment
+
+# ============================================================================
+# 🛠️ 核心硬件调节区（你只需要在此处直接改数字，保存即可生效）
+# ============================================================================
+# 1. 核心切换：单/双摄像头快速切换开关
+#    - 单摄像头测试填: [0]
+#    - 双摄像头测试填: [1, 0]
+USE_CAMERA_IDS = [1, 0]  # 👈 保持你要测试的 1 号和 0 号双摄像头
+
+# 2. 核心裁剪：单个摄像头的视野区域裁剪（ROI 比例控制）
+#    - 格式为：[xmin, ymin, xmax, ymax]，范围为 0.0 到 1.0
+CROP_ROI = [0.0, 0.0, 1.0, 1.0]  # 👈 直接在这里改比例数字
+
+# 3. 🆕 双摄独立撞线参数配置（按摄像头 ID 独立控制线段的位置、长度、间隔）
+#    参数说明 (均为 0.0~1.0 的画面比例)：
+#    - start_offset_ratio : 整体线段组距离画面左侧的起始偏移位置
+#    - segment_width_ratio: 单条线段的长度
+#    - gap_ratio          : 多条线段之间的间隔距离
+#    - y_position_ratio   : 线段在画面 Y 轴的高度（上下位置）
+CAMERA_LINE_SETTINGS = {
+    0: {
+        'start_offset_ratio': 0.05,
+        'segment_width_ratio': 0.15,
+        'gap_ratio': 0.42,
+        'y_position_ratio': 0.65
+    },
+    1: {
+        'start_offset_ratio': 0.28,  # 👈 例如：你可以把 1号相机的起始位置改得更靠左
+        'segment_width_ratio': 0.15, # 👈 例如：你可以把 1号相机的线段改得更长
+        'gap_ratio': 0.20,           # 👈 例如：你可以缩小 1号相机的线段间隔
+        'y_position_ratio': 0.65
+    }
+}
+
+# ============================================================================
+# 全局检测算法参数
+# ============================================================================
+CONF_THRESH = 0.5
+IOU_THRESHOLD = 0.4
+POSE_NUM = 17 * 3
+DET_NUM = 6
+SEG_NUM = 32
+OBB_NUM = 1
+
+# 检测框过滤参数
+MIN_BOX_AREA = 500
+MAX_BOX_AREA = 200000
+MIN_ASPECT_RATIO = 0.2
+MAX_ASPECT_RATIO = 5.0
+
+# 中心线 / 撞线 / 调试
+CENTER_LINE_CLASS_KEYWORDS = ['crop', 'corn']
+COLLISION_Y_TOLERANCE = 5
+APPROACH_WARN_DISTANCE = 50
+MIN_TRAJECTORY_POINTS = 3
+
+DEBUG_ASSOC = False
+DEBUG_TRACK = False
+DEBUG_PREDICT = True
+
+# 多线程并发安全锁（主单线程流水线化后，锁仅用于串口外设）
+INFER_LOCK = threading.Lock()
+SERIAL_LOCK = threading.Lock()
+GLOBAL_RUNNING = True
+
+
+# ============================================================================
+# 工具函数
+# ============================================================================
+def clamp(v, vmin, vmax):
+    return max(vmin, min(v, vmax))
+
+
+def bbox_center(bbox):
+    x1, y1, x2, y2 = bbox[:4]
+    return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
+def bbox_area(bbox):
+    x1, y1, x2, y2 = bbox[:4]
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def center_distance(b1, b2):
+    c1 = bbox_center(b1)
+    c2 = bbox_center(b2)
+    return math.hypot(c1[0] - c2[0], c1[1] - c2[1])
+
+
+def compute_center_line_from_bbox(bbox, image_width,
+                                  center_line_ratio=0.5, extend_ratio=0.0):
+    x1, y1, x2, y2 = map(int, bbox[:4])
+    cy = (y1 + y2) // 2
+    bw = x2 - x1
+    length = int(bw * center_line_ratio)
+    sx = x1 + (bw - length) // 2
+    ex = sx + length
+    if extend_ratio > 0:
+        el = int(bw * extend_ratio)
+        sx = max(0, sx - el)
+        ex = min(image_width - 1, ex + el)
+    return (sx, cy, ex, cy)
+
+
+# ============================================================================
+# 颜色配置
+# ============================================================================
+CLASS_COLORS = {
+    'weeds': (0, 0, 255),
+    'crop': (0, 255, 0),
+    'corn': (0, 255, 0),
+    'default': (255, 0, 255),
+}
+
+
+def get_class_color(class_name):
+    name = class_name.lower()
+    if 'weed' in name:
+        return CLASS_COLORS['weeds']
+    elif 'crop' in name or 'corn' in name:
+        return CLASS_COLORS['crop']
+    return CLASS_COLORS.get(name, CLASS_COLORS['default'])
+
+
+def should_draw_center_line(class_name):
+    name = class_name.lower()
+    for keyword in CENTER_LINE_CLASS_KEYWORDS:
+        if keyword in name:
+            return True
+    return False
+
+
+# ============================================================================
+# 串口通信
+# ============================================================================
+def init_serial(port="/dev/ttyUSB0", baudrate=115200):
+    if port is None:
+        return None
+    try:
+        com = serial.Serial(
+            port=port, baudrate=baudrate, bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE, timeout=1,
+        )
+        print(f"[串口] 连接成功: {port} @ {baudrate}")
+        return com
+    except Exception as e:
+        print(f"[串口] 连接失败: {e}（将以无串口模式运行）")
+        return None
+
+
+# ============================================================================
+# 增强型卡尔曼滤波跟踪器（只拟合 vy）
+# ============================================================================
+class KalmanBoxTracker:
+    count = 0
+    MAX_VELOCITY = 100
+
+    def __init__(self, bbox, class_id, conf, image_width=None, cl_ratio=0.5, cl_extend=0.0):
+        self.kf = cv2.KalmanFilter(8, 4)
+        self.kf.transitionMatrix = np.array([
+            [1, 0, 0, 0, 1, 0, 0, 0],
+            [0, 1, 0, 0, 0, 1, 0, 0],
+            [0, 0, 1, 0, 0, 0, 1, 0],
+            [0, 0, 0, 1, 0, 0, 0, 1],
+            [0, 0, 0, 0, 1, 0, 0, 0],
+            [0, 0, 0, 0, 0, 1, 0, 0],
+            [0, 0, 0, 0, 0, 0, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0, 1]
+        ], dtype=np.float32)
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0, 0, 0]
+        ], dtype=np.float32)
+
+        self.kf.processNoiseCov = np.eye(8, dtype=np.float32) * 0.01
+        self.kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * 1.0
+
+        x, y, w, h = self._convert_bbox_to_xywh(bbox)
+        self.kf.statePost = np.array([x, y, w, h, 0, 0, 0, 0], dtype=np.float32).reshape(8, 1)
+
+        self.time_since_update = 0
+        self.id = KalmanBoxTracker.count
+        KalmanBoxTracker.count += 1
+        self.history = deque(maxlen=10)
+        self.hits = 1
+        self.hit_streak = 1
+        self.age = 0
+        self.class_id = class_id
+        self.conf = conf
+        self.conf_history = deque([conf], maxlen=10)
+
+        self.prev_center_line = None
+        self.center_line_velocity = None
+
+        if image_width is not None and image_width > 0:
+            self.last_center_line = compute_center_line_from_bbox(bbox, image_width, cl_ratio, cl_extend)
+        else:
+            self.last_center_line = None
+
+        self._saved_velocity = None
+        self._saved_last_center_line = None
+        self._trajectory = deque(maxlen=30)
+        self._frame_counter = 0
+        self._before_line_base = {}
+        self._segment_ys = {}
+        self.just_recovered = False
+        self.recovered_from_id = None
+
+    def _convert_bbox_to_xywh(self, bbox):
+        x1, y1, x2, y2 = bbox[:4]
+        return (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
+
+    def _convert_xywh_to_bbox(self, x, y, w, h):
+        return [x - w / 2, y - h / 2, x + w / 2, y + h / 2]
+
+    def update(self, bbox, conf):
+        if self.time_since_update > 1:
+            if self.center_line_velocity is not None:
+                self._saved_velocity = self.center_line_velocity
+                self._saved_last_center_line = self.last_center_line
+            self.prev_center_line = None
+            self.last_center_line = None
+
+        self.time_since_update = 0
+        self.history.clear()
+        self.hits += 1
+        self.hit_streak += 1
+        self.conf_history.append(conf)
+        self.conf = float(np.mean(self.conf_history))
+
+        x, y, w, h = self._convert_bbox_to_xywh(bbox)
+        measurement = np.array([x, y, w, h], dtype=np.float32).reshape(4, 1)
+        self.kf.correct(measurement)
+
+    def predict(self):
+        self.kf.predict()
+        self.age += 1
+        self._frame_counter += 1
+
+        if self.time_since_update > 1:
+            self.hit_streak = 0
+        self.time_since_update += 1
+
+        state = self.kf.statePost
+        bbox = self._convert_xywh_to_bbox(state[0][0], state[1][0], state[2][0], state[3][0])
+        self.history.append(bbox)
+        return bbox
+
+    def get_state(self):
+        state = self.kf.statePost
+        return self._convert_xywh_to_bbox(state[0][0], state[1][0], state[2][0], state[3][0])
+
+    def update_center_line(self, center_line, segment_ys=None):
+        self.prev_center_line = self.last_center_line
+        self.last_center_line = center_line
+        self._trajectory.append((self._frame_counter, center_line))
+        self._fit_velocity()
+
+        if segment_ys is not None:
+            self._segment_ys = segment_ys
+            cy = center_line[1]
+            vy = self.center_line_velocity
+
+            for sid, seg_y in segment_ys.items():
+                moving_down = (vy is not None and vy > 0)
+                moving_up = (vy is not None and vy < 0)
+                if moving_down:
+                    if cy < seg_y:
+                        self._before_line_base[sid] = (self._frame_counter, center_line)
+                elif moving_up:
+                    if cy > seg_y:
+                        self._before_line_base[sid] = (self._frame_counter, center_line)
+                else:
+                    self._before_line_base[sid] = (self._frame_counter, center_line)
+
+    def _fit_velocity(self):
+        if len(self._trajectory) < MIN_TRAJECTORY_POINTS:
+            return
+        frames = np.array([t[0] for t in self._trajectory], dtype=np.float64)
+        cys = np.array([t[1][1] for t in self._trajectory], dtype=np.float64)
+        n = len(frames)
+        sum_f = frames.sum()
+        sum_f2 = (frames * frames).sum()
+        denom = n * sum_f2 - sum_f * sum_f
+        if abs(denom) < 1e-6:
+            return
+        vy = (n * (frames * cys).sum() - sum_f * cys.sum()) / denom
+        if abs(vy) > self.MAX_VELOCITY:
+            return
+        self.center_line_velocity = vy
+        self._saved_velocity = vy
+        self._saved_last_center_line = self.last_center_line
+
+    def get_effective_velocity(self):
+        if self.center_line_velocity is not None:
+            return self.center_line_velocity
+        return self._saved_velocity
+
+    def get_effective_last_center_line(self):
+        if self.last_center_line is not None:
+            return self.last_center_line
+        return self._saved_last_center_line
+
+    def predict_center_line_for_segment(self, seg_id):
+        vy = self.get_effective_velocity()
+        if vy is None:
+            return None
+        base_info = self._before_line_base.get(seg_id)
+        if base_info is not None:
+            base_frame, base_cl = base_info
+            dt = self._frame_counter - base_frame
+        else:
+            base_cl = self.get_effective_last_center_line()
+            if base_cl is None: return None
+            dt = self.time_since_update
+        if dt <= 0: return None
+        pred_sx = base_cl[0]
+        pred_cy = int(base_cl[1] + vy * dt)
+        pred_ex = base_cl[2]
+        return (pred_sx, pred_cy, pred_ex, pred_cy), base_cl, dt
+
+    def inherit_state_from(self, old_tracker):
+        self._trajectory = deque(old_tracker._trajectory, maxlen=30)
+        self._saved_velocity = old_tracker.get_effective_velocity()
+        self._saved_last_center_line = old_tracker.get_effective_last_center_line()
+        self.center_line_velocity = old_tracker.get_effective_velocity()
+        self._before_line_base = dict(old_tracker._before_line_base)
+        self._segment_ys = dict(old_tracker._segment_ys)
+        self.just_recovered = True
+        self.recovered_from_id = old_tracker.id
+
+
+# ============================================================================
+# 多目标关联跟踪器
+# ============================================================================
+class MultiObjectTracker:
+    def __init__(self, max_age=50, min_hits=1, iou_threshold=0.2, predict_frames=180,
+                 cl_ratio=0.5, cl_extend=0.0, dist_threshold=120, recover_max_age=45):
+        self.max_age = max(max_age, predict_frames)
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+        self.predict_frames = predict_frames
+        self.cl_ratio = cl_ratio
+        self.cl_extend = cl_extend
+        self.dist_threshold = dist_threshold
+        self.recover_max_age = max(recover_max_age, predict_frames)
+        self.trackers = []
+        self.frame_count = 0
+
+    def reset(self):
+        self.trackers = []
+        self.frame_count = 0
+
+    def _iou(self, bbox1, bbox2):
+        x1_min, y1_min, x1_max, y1_max = bbox1
+        x2_min, y2_min, x2_max, y2_max = bbox2
+        inter_x1 = max(x1_min, x2_min)
+        inter_y1 = max(y1_min, y2_min)
+        inter_x2 = min(x1_max, x2_max)
+        inter_y2 = min(y1_max, y2_max)
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+        area1 = max(0, x1_max - x1_min) * max(0, y1_max - y1_min)
+        area2 = max(0, x2_max - x2_min) * max(0, y2_max - y2_min)
+        union_area = area1 + area2 - inter_area
+        return inter_area / union_area if union_area > 0 else 0.0
+
+    def _associate(self, detections):
+        if len(self.trackers) == 0:
+            return [], list(range(len(detections))), []
+        if len(detections) == 0:
+            return [], [], list(range(len(self.trackers)))
+
+        num_dets = len(detections)
+        num_trks = len(self.trackers)
+        cost_matrix = np.full((num_dets, num_trks), 1e6, dtype=np.float32)
+        iou_matrix = np.zeros((num_dets, num_trks), dtype=np.float32)
+        dist_matrix = np.full((num_dets, num_trks), 1e6, dtype=np.float32)
+
+        for d, det in enumerate(detections):
+            for t, trk in enumerate(self.trackers):
+                if int(det[5]) != int(trk.class_id): continue
+                trk_bbox = trk.get_state()
+                iou = self._iou(det[:4], trk_bbox)
+                dist = center_distance(det[:4], trk_bbox)
+                iou_matrix[d, t] = iou
+                dist_matrix[d, t] = dist
+
+                if iou >= self.iou_threshold:
+                    cost = (1.0 - iou) + 0.002 * dist
+                elif dist <= self.dist_threshold:
+                    cost = 0.8 + 0.004 * dist
+                else:
+                    cost = 1e6
+                cost_matrix[d, t] = cost
+
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        matched = []
+        unmatched_dets = list(range(num_dets))
+        unmatched_trks = list(range(num_trks))
+
+        for r, c in zip(row_ind, col_ind):
+            if cost_matrix[r, c] >= 1e5: continue
+            iou = iou_matrix[r, c]
+            dist = dist_matrix[r, c]
+            if iou >= self.iou_threshold or dist <= self.dist_threshold:
+                matched.append([r, c])
+                if r in unmatched_dets: unmatched_dets.remove(r)
+                if c in unmatched_trks: unmatched_trks.remove(c)
+        return matched, unmatched_dets, unmatched_trks
+
+    def _try_recover_old_tracker(self, det, image_width):
+        best_old = None
+        best_score = 1e9
+        for trk in self.trackers:
+            if int(trk.class_id) != int(det[5]): continue
+            if trk.time_since_update <= 0 or trk.time_since_update > self.recover_max_age: continue
+            dist = center_distance(det[:4], trk.get_state())
+            if dist > self.dist_threshold: continue
+            score = dist + trk.time_since_update * 2.0
+            if score < best_score:
+                best_score = score
+                best_old = trk
+
+        new_trk = KalmanBoxTracker(det[:4], det[5], det[4], image_width=image_width, cl_ratio=self.cl_ratio,
+                                   cl_extend=self.cl_extend)
+        if best_old is not None and best_old.get_effective_velocity() is not None:
+            new_trk.inherit_state_from(best_old)
+        return new_trk
+
+    def update(self, detections, image_width=0):
+        self.frame_count += 1
+        for tracker in self.trackers: tracker.predict()
+
+        matched, unmatched_dets, unmatched_trks = self._associate(detections)
+        for det_idx, trk_idx in matched:
+            self.trackers[trk_idx].update(detections[det_idx][:4], detections[det_idx][4])
+            self.trackers[trk_idx].class_id = detections[det_idx][5]
+
+        for det_idx in unmatched_dets:
+            det = detections[det_idx]
+            trk = self._try_recover_old_tracker(det, image_width)
+            self.trackers.append(trk)
+
+        visible_results = []
+        predicted_trackers = []
+        to_remove = []
+
+        for i, tracker in enumerate(self.trackers):
+            if tracker.time_since_update == 0 and tracker.hit_streak >= self.min_hits:
+                bbox = tracker.get_state()
+                visible_results.append(bbox + [tracker.conf, tracker.class_id, tracker.id])
+            elif 0 < tracker.time_since_update <= self.predict_frames and tracker.get_effective_velocity() is not None:
+                predicted_trackers.append(tracker)
+
+            if tracker.time_since_update > self.max_age:
+                to_remove.append(i)
+
+        for i in reversed(to_remove):
+            self.trackers.pop(i)
+
+        return visible_results, predicted_trackers
+
+    def get_tracker_by_id(self, track_id):
+        for t in self.trackers:
+            if t.id == track_id:
+                return t
+        return None
+
+
+# ============================================================================
+# 虚拟线段配置
+# ============================================================================
+class LineConfig:
+    def __init__(self):
+        self.layout_mode = 'horizontal'
+        self.num_segments = 2  # 👈 默认每路相机内部绘制 2 条独立线段
+        self.horizontal_config = {'y_position_ratio': 0.5, 'segment_width_ratio': 0.15, 'gap_ratio': 0.15,
+                                  'start_offset_ratio': 0.28}
+        self.colors = [(0, 0, 255), (255, 0, 255), (255, 0, 0), (0, 255, 255), (0, 255, 0), (255, 255, 0),
+                       (128, 0, 128), (255, 165, 0)]
+        self.thickness = 3
+
+        # 允许定义所有可能的指令（扩展为支持多路独立映射）
+        self.commands = [b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8']
+
+        self.center_line_config = {'enabled': True, 'color': (0, 255, 255), 'thickness': 2, 'line_type': cv2.LINE_AA,
+                                   'extend_ratio': 0.0, 'center_line_ratio': 0.5}
+
+
+# ============================================================================
+# YoLov8TRT 类 (保持原样)
+# ============================================================================
+class YoLov8TRT(object):
+    def __init__(self, engine_file_path):
+        self.ctx = cuda.Device(0).make_context()
+        stream = cuda.Stream()
+        TRT_LOGGER = trt.Logger(trt.Logger.INFO)
+        runtime = trt.Runtime(TRT_LOGGER)
+
+        with open(engine_file_path, "rb") as f:
+            engine = runtime.deserialize_cuda_engine(f.read())
+        context = engine.create_execution_context()
+
+        host_inputs, cuda_inputs, host_outputs, cuda_outputs, bindings = [], [], [], [], []
+        for binding in engine:
+            size = trt.volume(engine.get_binding_shape(binding)) * engine.max_batch_size
+            dtype = trt.nptype(engine.get_binding_dtype(binding))
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            cuda_mem = cuda.mem_alloc(host_mem.nbytes)
+            bindings.append(int(cuda_mem))
+            if engine.binding_is_input(binding):
+                self.input_w = engine.get_binding_shape(binding)[-1]
+                self.input_h = engine.get_binding_shape(binding)[-2]
+                host_inputs.append(host_mem)
+                cuda_inputs.append(cuda_mem)
+            else:
+                host_outputs.append(host_mem)
+                cuda_outputs.append(cuda_mem)
+
+        self.stream = stream
+        self.context = context
+        self.engine = engine
+        self.host_inputs, self.cuda_inputs = host_inputs, cuda_inputs
+        self.host_outputs, self.cuda_outputs = host_outputs, cuda_outputs
+        self.bindings = bindings
+        self.batch_size = engine.max_batch_size
+        self.det_output_length = host_outputs[0].shape[0]
+
+    def infer(self, raw_image_generator):
+        self.ctx.push()
+        stream, context = self.stream, self.context
+        host_inputs, cuda_inputs = self.host_inputs, self.cuda_inputs
+        host_outputs, cuda_outputs = self.host_outputs, self.cuda_outputs
+        bindings = self.bindings
+
+        batch_image_raw, batch_origin_h, batch_origin_w = [], [], []
+        batch_input_image = np.empty(shape=[self.batch_size, 3, self.input_h, self.input_w])
+
+        for i, image_raw in enumerate(raw_image_generator):
+            input_image, image_raw, origin_h, origin_w = self.preprocess_image(image_raw)
+            batch_image_raw.append(image_raw)
+            batch_origin_h.append(origin_h)
+            batch_origin_w.append(origin_w)
+            np.copyto(batch_input_image[i], input_image)
+        batch_input_image = np.ascontiguousarray(batch_input_image)
+
+        np.copyto(host_inputs[0], batch_input_image.ravel())
+        start = time.time()
+        cuda.memcpy_htod_async(cuda_inputs[0], host_inputs[0], stream)
+        context.execute_async(batch_size=self.batch_size, bindings=bindings, stream_handle=stream.handle)
+        cuda.memcpy_dtoh_async(host_outputs[0], cuda_outputs[0], stream)
+        stream.synchronize()
+        end = time.time()
+        self.ctx.pop()
+
+        output = host_outputs[0]
+        result_boxes_list, result_scores_list, result_classid_list = [], [], []
+        for i in range(self.batch_size):
+            result_boxes, result_scores, result_classid = self.post_process(
+                output[i * self.det_output_length:(i + 1) * self.det_output_length], batch_origin_h[i],
+                batch_origin_w[i]
+            )
+            result_boxes_list.append(result_boxes)
+            result_scores_list.append(result_scores)
+            result_classid_list.append(result_classid)
+
+        return batch_image_raw, end - start, result_boxes_list, result_scores_list, result_classid_list
+
+    def destroy(self):
+        self.ctx.pop()
+
+    def get_raw_image_zeros(self):
+        for _ in range(self.batch_size):
+            yield np.zeros([self.input_h, self.input_w, 3], dtype=np.uint8)
+
+    def preprocess_image(self, raw_bgr_image):
+        image_raw = raw_bgr_image
+        h, w, c = image_raw.shape
+        image = cv2.cvtColor(image_raw, cv2.COLOR_BGR2RGB)
+        r_w, r_h = self.input_w / w, self.input_h / h
+        if r_h > r_w:
+            tw, th = self.input_w, int(r_w * h)
+            tx1 = tx2 = 0
+            ty1, ty2 = int((self.input_h - th) / 2), self.input_h - th - int((self.input_h - th) / 2)
+        else:
+            tw, th = int(r_h * w), self.input_h
+            tx1, tx2 = int((self.input_w - tw) / 2), self.input_w - tw - int((self.input_w - tw) / 2)
+            ty1 = ty2 = 0
+        image = cv2.resize(image, (tw, th))
+        image = cv2.copyMakeBorder(image, ty1, ty2, tx1, tx2, cv2.BORDER_CONSTANT, None, (128, 128, 128))
+        image = image.astype(np.float32) / 255.0
+        image = np.transpose(image, [2, 0, 1])
+        image = np.expand_dims(image, axis=0)
+        return np.ascontiguousarray(image), image_raw, h, w
+
+    def xywh2xyxy(self, origin_h, origin_w, x):
+        y = np.zeros_like(x)
+        r_w, r_h = self.input_w / origin_w, self.input_h / origin_h
+        if r_h > r_w:
+            y[:, 0], y[:, 2] = x[:, 0], x[:, 2]
+            y[:, 1] = x[:, 1] - (self.input_h - r_w * origin_h) / 2
+            y[:, 3] = x[:, 3] - (self.input_h - r_w * origin_h) / 2
+            y /= r_w
+        else:
+            y[:, 0] = x[:, 0] - (self.input_w - r_h * origin_w) / 2
+            y[:, 2] = x[:, 2] - (self.input_w - r_h * origin_w) / 2
+            y[:, 1], y[:, 3] = x[:, 1], x[:, 3]
+            y /= r_h
+        return y
+
+    def post_process(self, output, origin_h, origin_w):
+        num_values_per_detection = DET_NUM + SEG_NUM + POSE_NUM + OBB_NUM
+        num = int(output[0])
+        pred = np.reshape(output[1:], (-1, num_values_per_detection))[:num, :]
+        boxes = self.non_max_suppression(pred, origin_h, origin_w, conf_thres=CONF_THRESH, nms_thres=IOU_THRESHOLD)
+
+        if len(boxes) > 0:
+            filtered_boxes = []
+            for box in boxes:
+                x1, y1, x2, y2 = box[:4]
+                w, h = x2 - x1, y2 - y1
+                area, aspect_ratio = w * h, w / h if h > 0 else 0
+                if (MIN_BOX_AREA <= area <= MAX_BOX_AREA and MIN_ASPECT_RATIO <= aspect_ratio <= MAX_ASPECT_RATIO):
+                    filtered_boxes.append(box)
+            boxes = np.array(filtered_boxes) if filtered_boxes else np.array([])
+
+        return (boxes[:, :4], boxes[:, 4], boxes[:, 5]) if len(boxes) else (np.array([]), np.array([]), np.array([]))
+
+    def bbox_iou(self, box1, box2):
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1[:, 0], box1[:, 1], box1[:, 2], box1[:, 3]
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2[:, 0], box2[:, 1], box2[:, 2], box2[:, 3]
+        inter_rect_x1 = np.maximum(b1_x1, b2_x1)
+        inter_rect_y1 = np.maximum(b1_y1, b2_y1)
+        inter_rect_x2 = np.minimum(b1_x2, b2_x2)
+        inter_rect_y2 = np.minimum(b1_y2, b2_y2)
+        inter_area = np.clip(inter_rect_x2 - inter_rect_x1 + 1, 0, None) * np.clip(inter_rect_y2 - inter_rect_y1 + 1, 0, None)
+        b1_area = (b1_x2 - b1_x1 + 1) * (b1_y2 - b1_y1 + 1)
+        b2_area = (b2_x2 - b2_x1 + 1) * (b2_y2 - b2_y1 + 1)
+        return inter_area / (b1_area + b2_area - inter_area + 1e-16)
+
+    def non_max_suppression(self, prediction, origin_h, origin_w, conf_thres=0.5, nms_thres=0.4):
+        boxes = prediction[prediction[:, 4] >= conf_thres]
+        boxes[:, :4] = self.xywh2xyxy(origin_h, origin_w, boxes[:, :4])
+        boxes[:, 0] = np.clip(boxes[:, 0], 0, origin_w - 1)
+        boxes[:, 2] = np.clip(boxes[:, 2], 0, origin_w - 1)
+        boxes[:, 1] = np.clip(boxes[:, 1], 0, origin_h - 1)
+        boxes[:, 3] = np.clip(boxes[:, 3], 0, origin_h - 1)
+        boxes = boxes[np.argsort(-boxes[:, 4])]
+        keep_boxes = []
+        while boxes.shape[0]:
+            large_overlap = self.bbox_iou(np.expand_dims(boxes[0, :4], 0), boxes[:, :4]) > nms_thres
+            label_match = boxes[0, -1] == boxes[:, -1]
+            invalid = large_overlap & label_match
+            keep_boxes += [boxes[0]]
+            boxes = boxes[~invalid]
+        return np.stack(keep_boxes, 0) if len(keep_boxes) else np.array([])
+
+
+# ============================================================================
+# 增强型基础检测处理器（vy-only 预测 + 完整 X 轴撞线检测）
+# ============================================================================
+class BaseDetectionProcessor:
+    TRIGGER_HIGHLIGHT_FRAMES = 5
+
+    def __init__(self, yolov8_wrapper, config=None, tracker_cfg=None, serial_conn=None, categories=None,
+                 segment_offset=0):
+        self.yolov8_wrapper = yolov8_wrapper
+        self.config = config if config is not None else LineConfig()
+        self.serial_conn = serial_conn
+        self.categories = categories or ["corn"]
+        self.triggered_records = defaultdict(lambda: defaultdict(bool))
+        self.segment_offset = segment_offset
+
+        tk_cfg = tracker_cfg or {}
+        cl_cfg = self.config.center_line_config
+        self.tracker = MultiObjectTracker(
+            max_age=tk_cfg.get('max_age', 60), min_hits=tk_cfg.get('min_hits', 1),
+            iou_threshold=tk_cfg.get('iou_threshold', 0.2), predict_frames=tk_cfg.get('predict_frames', 60),
+            cl_ratio=cl_cfg.get('center_line_ratio', 0.5), cl_extend=cl_cfg.get('extend_ratio', 0.0),
+            dist_threshold=tk_cfg.get('dist_threshold', 120), recover_max_age=tk_cfg.get('recover_max_age', 60)
+        )
+        self.segment_highlight = {}
+        self.all_visible_y = []
+
+    def _get_class_name(self, class_id):
+        cid = int(class_id)
+        return self.categories[cid] if 0 <= cid < len(self.categories) else str(cid)
+
+    def _get_segment_ys(self, segments):
+        return {seg['id']: (seg['start'][1] + seg['end'][1]) // 2 for seg in segments}
+
+    def get_segment_lines(self, width, height):
+        segments = []
+        cfg = self.config
+        num_segments = min(cfg.num_segments, 8)
+        if cfg.layout_mode == 'horizontal':
+            hc = cfg.horizontal_config
+            center_y = int(height * hc['y_position_ratio'])
+            seg_w = int(width * hc['segment_width_ratio'])
+            gap = int(width * hc['gap_ratio'])
+            offset = int(width * hc['start_offset_ratio'])
+            total_seg_width = num_segments * seg_w + (num_segments - 1) * gap
+            if total_seg_width > width:
+                gap = max(5, int((width - num_segments * seg_w) / (num_segments - 1)))
+            for i in range(num_segments):
+                sx = offset + i * (seg_w + gap)
+                ex = min(sx + seg_w, width)
+
+                global_id = i + self.segment_offset
+                if sx < width:
+                    segments.append(
+                        {'start': (sx, center_y), 'end': (ex, center_y),
+                         'color': cfg.colors[global_id % len(cfg.colors)],
+                         'id': i}
+                    )
+        return segments
+
+    def draw_segment_lines(self, frame, segments):
+        for seg in segments:
+            sid = seg['id']
+            global_id = sid + self.segment_offset
+            highlight = self.segment_highlight.get(sid)
+            if highlight and highlight['remaining'] > 0:
+                line_color = (255, 255, 255) if highlight['remaining'] % 2 == 1 else (0, 255, 255)
+                cv2.line(frame, seg['start'], seg['end'], line_color, self.config.thickness + 4, cv2.LINE_AA)
+                mx, my = (seg['start'][0] + seg['end'][0]) // 2, (seg['start'][1] + seg['end'][1]) // 2
+
+                cmd_val = self.config.commands[global_id].decode('utf-8') if global_id < len(self.config.commands) else str(global_id)
+                alert_text = f"SEND: {cmd_val} ID:{highlight['track_id']}"
+                cv2.putText(frame, alert_text, (mx - 50, my - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                highlight['remaining'] -= 1
+            else:
+                cv2.line(frame, seg['start'], seg['end'], seg['color'], self.config.thickness, cv2.LINE_AA)
+
+    def _activate_segment_highlight(self, seg_id, track_id, trigger_type='normal'):
+        self.segment_highlight[seg_id] = {'remaining': self.TRIGGER_HIGHLIGHT_FRAMES, 'track_id': track_id, 'type': trigger_type}
+
+    def _compute_center_line(self, box, image_width):
+        cl_cfg = self.config.center_line_config
+        return compute_center_line_from_bbox(box, image_width, cl_cfg.get('center_line_ratio', 0.5), cl_cfg.get('extend_ratio', 0.0))
+
+    def _is_prediction_still_useful_for_segment(self, tracker, pred_cl, seg, extra_margin=10):
+        vy = tracker.get_effective_velocity()
+        if vy is None: return True
+        cy, seg_mid_y = pred_cl[1], (seg['start'][1] + seg['end'][1]) / 2.0
+        tol = COLLISION_Y_TOLERANCE + extra_margin
+        if vy > 0 and cy > seg_mid_y + tol: return False
+        if vy < 0 and cy < seg_mid_y - tol: return False
+        return True
+
+    def _check_collision(self, center_line, segments, track_id):
+        triggered = []
+        csx, cy, cex, _ = center_line
+        tol = COLLISION_Y_TOLERANCE
+        for seg in segments:
+            sid = seg['id']
+            ss, se = seg['start'], seg['end']
+            if ss[1] == se[1] and abs(cy - ss[1]) <= tol:
+                if not (cex < min(ss[0], se[0]) or csx > max(ss[0], se[0])):
+                    if not self.triggered_records[track_id][sid]:
+                        triggered.append(sid)
+                        self.triggered_records[track_id][sid] = True
+        return triggered
+
+    def _send_serial(self, seg_id):
+        global_id = seg_id + self.segment_offset
+        if self.serial_conn is not None and global_id < len(self.config.commands):
+            with SERIAL_LOCK:
+                try:
+                    self.serial_conn.write(self.config.commands[global_id])
+                    print(f"[触发] 摄像头偏移={self.segment_offset} 发送串口命令: {self.config.commands[global_id].decode('utf-8')}")
+                except Exception as e:
+                    print(f"[串口] 发送失败: {e}")
+
+    def process_frame(self, frame, send_serial=True, conf_thresh=0.5):
+        height, width = frame.shape[:2]
+        segments = self.get_segment_lines(width, height)
+        segment_ys = self._get_segment_ys(segments)
+
+        batch_image_raw, inference_time, result_boxes_list, result_scores_list, result_classid_list = \
+            self.yolov8_wrapper.infer([frame])
+
+        if not batch_image_raw:
+            return frame, 0, 0, 0, {'normal_triggers': [], 'predicted_triggers': []}
+
+        processed_frame = batch_image_raw[0]
+        detections = []
+        if len(result_boxes_list[0]) > 0:
+            for i in range(len(result_boxes_list[0])):
+                detections.append(list(result_boxes_list[0][i]) + [float(result_scores_list[0][i]), int(result_classid_list[0][i])])
+
+        visible_objects, predicted_trackers = self.tracker.update(detections, image_width=width)
+        all_triggered = []
+        active_ids = set()
+        trigger_info = {'normal_triggers': [], 'predicted_triggers': []}
+
+        for obj in visible_objects:
+            x1, y1, x2, y2, conf, cls_id, tid = obj
+            tid, cls_id = int(tid), int(cls_id)
+            active_ids.add(tid)
+            class_name = self._get_class_name(cls_id)
+            is_crop = 'crop' in class_name.lower() or 'corn' in class_name.lower()
+
+            if is_crop:
+                cv2.rectangle(processed_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                cv2.putText(processed_frame, f"ID:{tid} {conf:.2f}", (int(x1), int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5, (0, 255, 0), 2)
+
+                if should_draw_center_line(class_name):
+                    cl = self._compute_center_line([x1, y1, x2, y2], width)
+                    cv2.line(processed_frame, (cl[0], cl[1]), (cl[2], cl[3]), (0, 255, 255), 2)
+                    tracker_obj = self.tracker.get_tracker_by_id(tid)
+                    if tracker_obj:
+                        tracker_obj.update_center_line(cl, segment_ys)
+                    triggered = self._check_collision(cl, segments, tid)
+                    all_triggered.extend(triggered)
+                    if triggered:
+                        trigger_info['normal_triggers'].extend([{'track_id': tid, 'seg_id': s} for s in triggered])
+                        for sid in triggered: self._activate_segment_highlight(sid, tid, 'normal')
+
+        for tracker in predicted_trackers:
+            tid = tracker.id
+            active_ids.add(tid)
+            for seg in segments:
+                sid = seg['id']
+                res = tracker.predict_center_line_for_segment(sid)
+                if res:
+                    pred_cl, base_cl, dt = res
+                    if not self._is_prediction_still_useful_for_segment(tracker, pred_cl, seg): continue
+                    triggered = self._check_collision(pred_cl, [seg], tid)
+                    if triggered:
+                        all_triggered.extend(triggered)
+                        for s in triggered: self._activate_segment_highlight(s, tid, 'predict')
+
+        self.draw_segment_lines(processed_frame, segments)
+        if send_serial:
+            for sid in set(all_triggered): self._send_serial(sid)
+
+        return processed_frame, inference_time, len(detections), len(visible_objects), trigger_info
+
+
+# ============================================================================
+# 极轻量级硬件视频抓取流线程
+# ============================================================================
+class CameraGrabber(threading.Thread):
+    def __init__(self, camera_id=0):
+        threading.Thread.__init__(self)
+        self.camera_id = camera_id
+        self.capture = None
+        self.frame = None
+        self.ret = False
+        self.is_ready = False
+
+    def run(self):
+        global GLOBAL_RUNNING
+        try:
+            print(f"[相机抓取流] 正在拉起底层 V4L2 硬件通道 ID: {self.camera_id}...")
+            self.capture = cv2.VideoCapture(self.camera_id, cv2.CAP_V4L2)
+            time.sleep(0.5)
+
+            if not self.capture.isOpened():
+                print(f"❌ [相机致命伤] 抓取流无法开启摄像头 ID: {self.camera_id}")
+                return
+
+            self.capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            time.sleep(0.15)
+            self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            time.sleep(0.15)
+            self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            time.sleep(0.15)
+            self.capture.set(cv2.CAP_PROP_FPS, 30)
+            time.sleep(0.4)
+
+            for _ in range(10):
+                self.capture.read()
+                time.sleep(0.02)
+
+            self.is_ready = True
+            print(f"✅ [相机抓取流] 摄像头 ID: {self.camera_id} 硬件初始化成功，进入轮询就绪态。")
+        except Exception as e:
+            print(f"❌ [相机致命异常] 摄像头 ID: {self.camera_id} 抓取流损坏: {e}")
+            return
+
+        while GLOBAL_RUNNING:
+            ret, frame = self.capture.read()
+            if ret:
+                self.frame = frame
+                self.ret = True
+            else:
+                time.sleep(0.01)
+
+        if self.capture is not None:
+            self.capture.release()
+
+
+# ============================================================================
+# 视频文件检测器
+# ============================================================================
+class VideoDetector:
+    def __init__(self, yolov8_wrapper, config=None, tracker_cfg=None, serial_conn=None, categories=None):
+        self.config = config if config is not None else LineConfig()
+        self.processor = BaseDetectionProcessor(yolov8_wrapper, config, tracker_cfg, serial_conn, categories, segment_offset=0)
+
+    def detect_video(self, video_path, output_path=None, show_display=True, send_serial=False, conf_thresh=0.5):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened(): return None
+        fps, w, h = int(cap.get(cv2.CAP_PROP_FPS)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h)) if output_path else None
+
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            processed, inf_time, _, _, _ = self.processor.process_frame(frame, send_serial=send_serial, conf_thresh=conf_thresh)
+            if writer: writer.write(processed)
+            if show_display:
+                cv2.imshow('Detection', processed)
+                if cv2.waitKey(1) & 0xFF == ord('q'): break
+        cap.release()
+        if writer: writer.release()
+        cv2.destroyAllWindows()
+
+
+class warmUpThread(threading.Thread):
+    def __init__(self, yolov8_wrapper):
+        threading.Thread.__init__(self)
+        self.yolov8_wrapper = yolov8_wrapper
+
+    def run(self):
+        with INFER_LOCK:
+            self.yolov8_wrapper.infer(self.yolov8_wrapper.get_raw_image_zeros())
+
+
+# ============================================================================
+# 命令行参数
+# ============================================================================
+def parse_args():
+    p = argparse.ArgumentParser(description='作物/杂草检测系统 (硬编码可调参数版)')
+    p.add_argument('--mode', type=str, default='camera', choices=['camera', 'video'])
+    p.add_argument('--engine', type=str, default='/home/jetson/Desktop/tensorrtx-master/yolov8/build/crop.engine')
+    p.add_argument('--plugin', type=str, default='./build/libmyplugins.so')
+    p.add_argument('--video', type=str, default=None)
+    p.add_argument('--output', type=str, default=None)
+    p.add_argument('--conf', type=float, default=0.6)
+    p.add_argument('--no-display', action='store_true')
+    p.add_argument('--categories', type=str, nargs='+', default=['crop', 'weeds'])
+    p.add_argument('--serial-port', type=str, default=None)
+    p.add_argument('--serial-baud', type=int, default=115200)
+    p.add_argument('--send-serial', action='store_true')
+    p.add_argument('--no-serial', action='store_true')
+    p.add_argument('--line-mode', type=str, default='horizontal')
+    p.add_argument('--num-segments', type=int, default=2)  # 👈 默认每路绘制 2 条线
+    p.add_argument('--line-y', type=float, default=0.65)
+    p.add_argument('--line-width', type=float, default=0.15)
+    p.add_argument('--max-age', type=int, default=60)
+    p.add_argument('--min-hits', type=int, default=1)
+    p.add_argument('--iou-thresh', type=float, default=0.2)
+    p.add_argument('--predict-frames', type=int, default=60)
+    p.add_argument('--dist-threshold', type=float, default=120.0)
+    p.add_argument('--recover-max-age', type=int, default=60)
+    p.add_argument('--collision-tolerance', type=int, default=30)
+    p.add_argument('--min-traj-points', type=int, default=3)
+    return p.parse_args()
+
+
+# ============================================================================
+# 主控流水线中心
+# ============================================================================
+if __name__ == "__main__":
+    args = parse_args()
+    COLLISION_Y_TOLERANCE = args.collision_tolerance
+    MIN_TRAJECTORY_POINTS = args.min_traj_points
+    CONF_THRESH = args.conf
+
+    try:
+        ctypes.CDLL(args.plugin)
+    except Exception as e:
+        pass
+
+    tracker_cfg = {'max_age': args.max_age, 'min_hits': args.min_hits, 'iou_threshold': args.iou_thresh,
+                   'predict_frames': args.predict_frames, 'dist_threshold': args.dist_threshold,
+                   'recover_max_age': args.recover_max_age}
+
+    serial_conn = None
+    if not args.no_serial and (args.serial_port or args.send_serial):
+        port = args.serial_port or '/dev/ttyUSB0'
+        serial_conn = init_serial(port, args.serial_baud)
+
+    yolov8_wrapper = YoLov8TRT(args.engine)
+
+    try:
+        print("进行引擎冷预热...")
+        for _ in range(3):
+            w_thread = warmUpThread(yolov8_wrapper)
+            w_thread.start()
+            w_thread.join()
+
+        if args.mode == 'camera':
+            print(f"📡 拉起目标摄像头工作列表: {USE_CAMERA_IDS}")
+            print(f"✂️ 当前图像感兴趣区域裁剪(ROI)参数: {CROP_ROI}")
+
+            grabbers = {}
+            processors = {}
+
+            total_normals = defaultdict(int)
+            total_predicts = defaultdict(int)
+
+            # 🟢 遍历启动多路相机，并为每个相机注入完全独立的线段配置
+            for idx, cam_id in enumerate(USE_CAMERA_IDS):
+                current_offset = idx * args.num_segments
+                print(f"正在建立物理抓取通道，开启子流进程 ID: {cam_id} ... 对应全局命令起始索引: {current_offset}")
+
+                # --- 核心改动：为每个相机独立实例化配置对象 ---
+                cam_line_cfg = LineConfig()
+                cam_line_cfg.layout_mode = args.line_mode
+                cam_line_cfg.num_segments = args.num_segments
+
+                # 从 CAMERA_LINE_SETTINGS 字典中读取当前相机专属配置
+                if cam_id in CAMERA_LINE_SETTINGS:
+                    cam_line_cfg.horizontal_config.update(CAMERA_LINE_SETTINGS[cam_id])
+                else:
+                    # 如果未定义，则使用命令行全局参数
+                    cam_line_cfg.horizontal_config['y_position_ratio'] = args.line_y
+                    cam_line_cfg.horizontal_config['segment_width_ratio'] = args.line_width
+
+                # 传入独立化配置
+                processors[cam_id] = BaseDetectionProcessor(yolov8_wrapper, config=cam_line_cfg, tracker_cfg=tracker_cfg,
+                                                            serial_conn=serial_conn, categories=args.categories,
+                                                            segment_offset=current_offset)
+                grabbers[cam_id] = CameraGrabber(camera_id=cam_id)
+                grabbers[cam_id].start()
+
+                while not grabbers[cam_id].is_ready and GLOBAL_RUNNING:
+                    time.sleep(0.1)
+                time.sleep(1.5)
+
+            print("🚀 所有硬件通道全部安全挂载完毕。主单线程流水线推理中心全面激活！")
+
+            while GLOBAL_RUNNING:
+                for cam_id in USE_CAMERA_IDS:
+                    grabber = grabbers[cam_id]
+                    if grabber.ret and grabber.frame is not None:
+                        frame = grabber.frame.copy()
+
+                        if CROP_ROI != [0.0, 0.0, 1.0, 1.0]:
+                            h, w = frame.shape[:2]
+                            xmin, ymin, xmax, ymax = CROP_ROI
+                            x1, y1, x2, y2 = int(xmin * w), int(ymin * h), int(xmax * w), int(ymax * h)
+                            frame = frame[y1:y2, x1:x2]
+
+                        try:
+                            processed_frame, inference_time, raw_count, tracked_count, trigger_info = \
+                                processors[cam_id].process_frame(frame, send_serial=True, conf_thresh=args.conf)
+
+                            total_normals[cam_id] += len(trigger_info['normal_triggers'])
+                            total_predicts[cam_id] += len(trigger_info['predicted_triggers'])
+
+                            info_text = [
+                                f"Camera Channel: {cam_id}",
+                                f"TRT Infer: {inference_time * 1000:.1f}ms",
+                                f"Tracked Objects: {tracked_count}",
+                                f"Triggers: normal={total_normals[cam_id]} pred={total_predicts[cam_id]}",
+                            ]
+                            for i, text in enumerate(info_text):
+                                cv2.putText(processed_frame, text, (10, 30 + i * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                            (0, 255, 0), 2)
+
+                            cv2.imshow(f'Detection - Camera {cam_id}', processed_frame)
+
+                        except Exception as e:
+                            traceback.print_exc()
+                            cv2.imshow(f'Detection - Camera {cam_id}', frame)
+
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    GLOBAL_RUNNING = False
+                    break
+
+            cv2.destroyAllWindows()
+
+        elif args.mode == 'video':
+            # 兼容视频模式回放，默认调取摄像头 0 的参数配置
+            video_line_cfg = LineConfig()
+            video_line_cfg.layout_mode = args.line_mode
+            video_line_cfg.num_segments = args.num_segments
+            if 0 in CAMERA_LINE_SETTINGS:
+                video_line_cfg.horizontal_config.update(CAMERA_LINE_SETTINGS[0])
+            else:
+                video_line_cfg.horizontal_config['y_position_ratio'] = args.line_y
+                video_line_cfg.horizontal_config['segment_width_ratio'] = args.line_width
+
+            video_detector = VideoDetector(yolov8_wrapper, config=video_line_cfg, tracker_cfg=tracker_cfg,
+                                           serial_conn=serial_conn, categories=args.categories)
+            video_path = args.video or '/home/jetson/Desktop/crop2.mp4'
+            video_detector.detect_video(video_path, output_path=args.output, show_display=not args.no_display,
+                                        send_serial=args.send_serial, conf_thresh=args.conf)
+
+    except KeyboardInterrupt:
+        print("\n[系统安全退出] 键盘中断")
+        GLOBAL_RUNNING = False
+    finally:
+        yolov8_wrapper.destroy()
+        if serial_conn is not None: serial_conn.close()
+        print("系统资源完全释放。")
